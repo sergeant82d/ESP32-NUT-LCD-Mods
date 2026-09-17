@@ -1,0 +1,173 @@
+diff --git a/include/core/main.h b/include/core/main.h
+index cd66326..7cb835c 100644
+--- a/include/core/main.h
++++ b/include/core/main.h
+@@ -6,6 +6,9 @@
+ #include "network/network_manager.h"
+ #include "NUTServer.h"
+ #include "DiagnosticLED.h"
++#ifdef BOARD_HAS_LCD
++#include "LcdDisplay.h"
++#endif
+ 
+ // Definizioni globali ed intestazioni del firmware
+ #define MONITOR_BAUD_RATE 115200
+diff --git a/platformio.ini b/platformio.ini
+index 31593d6..c726c0b 100644
+--- a/platformio.ini
++++ b/platformio.ini
+@@ -17,10 +17,50 @@ board_build.flash_size = 8MB
+ board_build.partitions = partitions.csv
+ board_build.f_flash = 80000000L
+ test_build_src = true
++; LcdDisplay pulls in lvgl/LovyanGFX and only makes sense on the Elecrow
++; board below -- explicitly excluded here so PlatformIO's dependency
++; scanner never tries to build it (and pull those libs in) for this target.
++lib_ignore =
++    LcdDisplay
+ lib_deps =
+     ${env.lib_deps}
+     adafruit/Adafruit NeoPixel@^1.12.0
+ 
++; ---------------------------------------------------------
++; 2. Environment per Firmware su Elecrow CrowPanel Advance 2.4"
++;    Same firmware, PLUS the on-board LCD dashboard, running on the
++;    display's own native USB-OTG host port (GPIO19/20) instead of a
++;    separate Wi-Fi-connected display board.
++; ---------------------------------------------------------
++[env:elecrow-2.4-onboard]
++platform = https://github.com/pioarduino/platform-espressif32.git#51.03.04
++board = esp32-s3-devkitc-1
++framework = arduino
++extra_scripts = pre:scripts/embed_web.py
++test_build_src = true
++
++; Elecrow CrowPanel Advance 2.4" (DIS01624A): ESP32-S3-WROOM-1-N16R8,
++; 16MB quad flash, 8MB octal PSRAM. Matches Elecrow's documented Arduino
++; IDE settings (Flash Size 16MB, PSRAM: OPI PSRAM, Partition: Huge APP) --
++; except we reuse esp32-nut's own partitions.csv (OTA-capable, and an
++; 8MB-sized table fits fine on this 16MB chip with room to spare).
++board_build.partitions = partitions.csv
++board_build.flash_mode = qio
++board_build.flash_size = 16MB
++board_build.f_flash = 80000000L
++board_build.psram_type = opi
++board_build.arduino.memory_type = qio_opi
++
++build_flags =
++    -DBOARD_HAS_LCD
++    -DBOARD_HAS_PSRAM
++    -DLV_CONF_INCLUDE_SIMPLE
++
++lib_deps =
++    ${env.lib_deps}
++    lvgl/lvgl@^8.3.11
++    lovyan03/LovyanGFX@^1.1.16
++
+ ; ---------------------------------------------------------
+ ; 3. Environment per i Test (Native)
+ ; ---------------------------------------------------------
+@@ -34,6 +74,7 @@ lib_ignore =
+     USBHostUPS
+     DiagnosticLED
+     NUTServer
++    LcdDisplay
+ test_ignore = test_diagnostic_led, test_network_manager, test_ota_handler, test_system_state, test_usb_host, integration, test_config_manager
+ build_src_filter =
+     -<*>
+diff --git a/src/core/main.cpp b/src/core/main.cpp
+index 69421ba..d07ad8c 100644
+--- a/src/core/main.cpp
++++ b/src/core/main.cpp
+@@ -15,6 +15,9 @@ Preferences boot_prefs;
+ bool is_ap_mode = false;
+ bool clear_ap_flag_pending = false;
+ uint32_t boot_time_ms = 0;
++#ifdef BOARD_HAS_LCD
++String g_wifi_ssid;
++#endif
+ 
+ // Calcola lo stato diagnostico del sistema a partire dallo stato Wi-Fi e UPS
+ LedState computeSystemState(bool wifiConnected, bool upsConnected) {
+@@ -37,8 +40,16 @@ void setup() {
+     delay(1000); // Piccolo delay per stabilizzare la connessione seriale
+     AppLogger::log("INFO", "\n--- ESP32 NUT Server Initialized ---");
+ 
++#ifdef BOARD_HAS_LCD
++    // The Elecrow board has no physical NeoPixel, and its power pin (GPIO38)
++    // is this board's LCD backlight pin -- so skip the diagnostic LED
++    // entirely here rather than have two subsystems claim the same pin.
++    // The on-screen status dots (built into LcdDisplay) take over its job.
++    lcd_display.begin();
++#else
+     // Inizializzazione del LED diagnostico
+     diagnostic_led.begin(LED_BUILTIN_PIN);
++#endif
+ 
+     // Gestione NVS flag per AP manuale
+     boot_prefs.begin("boot_state", false);
+@@ -62,12 +73,18 @@ void setup() {
+         network_mgr.beginAP("NUT_ESP32_Config", "12345678");
+         web_server.setUPS(&usb_ups);
+         web_server.begin(true);
++#ifdef BOARD_HAS_LCD
++        lcd_display.showApMode("NUT_ESP32_Config", "12345678");
++#endif
+     } else {
+         is_ap_mode = false;
+         AppLogger::log("INFO", "[MAIN] Configuration loaded successfully.");
+         // Stampa parametri per verifica
+         WifiConfig wifi = config_mgr.getWifiConfig();
+         NutConfig nut = config_mgr.getNutConfig();
++#ifdef BOARD_HAS_LCD
++        g_wifi_ssid = wifi.ssid;
++#endif
+         AppLogger::log("INFO", "[MAIN] Wi-Fi SSID: %s\n", wifi.ssid.c_str());
+         AppLogger::log("INFO", "[MAIN] NUT UPS Name: %s\n", nut.ups_name.c_str());
+         
+@@ -121,6 +138,10 @@ void loop() {
+     network_mgr.loop();
+     usb_ups.loop();
+ 
++#ifdef BOARD_HAS_LCD
++    lcd_display.loop();  // pump LVGL's timer/redraw handler every iteration
++#endif
++
+     // Se la configurazione non è valida, rimaniamo in modalità di attesa sicura
+     if (!config_mgr.isValid()) {
+         static uint32_t last_safe_print = 0;
+@@ -128,9 +149,13 @@ void loop() {
+             last_safe_print = now;
+             AppLogger::log("WARN", "[MAIN] WARNING: System in safe waiting mode. Configuration missing or invalid!");
+         }
+-        
++
++#ifndef BOARD_HAS_LCD
+         diagnostic_led.setState(computeSystemState(network_mgr.isConnected(), usb_ups.isConnected()));
+         diagnostic_led.update();
++#endif
++        // Note: while in this state is_ap_mode is already true and the LCD
++        // (if present) is already showing the setup screen from setup().
+         delay(10);
+         return;
+     }
+@@ -146,9 +171,19 @@ void loop() {
+                       usb_ups.getUPSData()->getFloat("output.voltage"));
+     }
+ 
++#ifdef BOARD_HAS_LCD
++    // Refresh the on-screen dashboard a few times a second -- data comes
++    // straight from usb_ups in-process, no network round trip needed.
++    static uint32_t last_lcd_update = 0;
++    if (now - last_lcd_update >= 1000) {
++        last_lcd_update = now;
++        lcd_display.updateDashboard(&usb_ups, network_mgr.isConnected(), g_wifi_ssid);
++    }
++#else
+     // Aggiornamento stato LED diagnostico
+     diagnostic_led.setState(computeSystemState(network_mgr.isConnected(), usb_ups.isConnected()));
+     diagnostic_led.update();
++#endif
+ 
+     delay(10);
+ }
